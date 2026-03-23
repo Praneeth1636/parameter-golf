@@ -69,7 +69,7 @@ class Hyperparameters:
 
     # Model (defaults match the current baseline setup).
     vocab_size: int = int(os.environ.get("VOCAB_SIZE", 1024))
-    num_layers: int = int(os.environ.get("NUM_LAYERS", 9))
+    num_layers: int = int(os.environ.get("NUM_LAYERS", 11))
     model_dim: int = int(os.environ.get("MODEL_DIM", 512))
     num_heads: int = int(os.environ.get("NUM_HEADS", 8))
     num_kv_heads: int = int(os.environ.get("NUM_KV_HEADS", 4))
@@ -124,7 +124,7 @@ CONTROL_TENSOR_NAME_PATTERNS = tuple(
     pattern
     for pattern in os.environ.get(
         "CONTROL_TENSOR_NAME_PATTERNS",
-        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights",
+        "attn_scale,attn_scales,mlp_scale,mlp_scales,mhc_w,q_gain,skip_weight,skip_weights",
     ).split(",")
     if pattern
 )
@@ -368,11 +368,16 @@ class Block(nn.Module):
         self.mlp = MLP(dim, mlp_mult)
         self.attn_scale = mx.ones((dim,), dtype=mx.float32)
         self.mlp_scale = mx.ones((dim,), dtype=mx.float32)
-        self.resid_mix = mx.array(np.stack((np.ones((dim,), dtype=np.float32), np.zeros((dim,), dtype=np.float32))))
+        # mHC: 3-way per-dim softmax mixing [w_x, w_x0, w_x_extra]
+        # Init biased toward current x: softmax([5,0,0]) ≈ [0.987, 0.007, 0.007]
+        mhc_init = np.zeros((3, dim), dtype=np.float32)
+        mhc_init[0] = 5.0
+        self.mhc_w = mx.array(mhc_init)
 
-    def __call__(self, x: mx.array, x0: mx.array) -> mx.array:
-        mix = self.resid_mix.astype(x.dtype)
-        x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
+    def __call__(self, x: mx.array, x0: mx.array, x_extra: mx.array) -> mx.array:
+        # Manifold-constrained mixing: softmax over dim=0 → weights sum to 1, all >= 0
+        w = mx.softmax(self.mhc_w.astype(x.dtype), axis=0)  # [3, dim]
+        x = w[0][None, None, :] * x + w[1][None, None, :] * x0 + w[2][None, None, :] * x_extra
         attn_out = self.attn(self.attn_norm(x))
         x = x + self.attn_scale.astype(x.dtype)[None, None, :] * attn_out
         x = x + self.mlp_scale.astype(x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
@@ -421,15 +426,15 @@ class GPT(nn.Module):
         skips: list[mx.array] = []
 
         for i in range(self.num_encoder_layers):
-            x = self.blocks[i](x, x0)
+            x = self.blocks[i](x, x0, x0)  # encoder: x_extra = x0
             skips.append(x)
+
+        x_mid = x  # last encoder output passed as x_extra to all decoder blocks
+
         for i in range(self.num_decoder_layers):
-            # Odd layer counts have one more decoder block than encoder block. The baseline only
-            # applies a skip connection when one exists, then runs the remaining decoder block(s)
-            # without an added skip.
             if skips:
                 x = x + self.skip_weights[i].astype(x.dtype)[None, None, :] * skips.pop()
-            x = self.blocks[self.num_encoder_layers + i](x, x0)
+            x = self.blocks[self.num_encoder_layers + i](x, x0, x_mid)  # decoder: x_extra = x_mid
         return self.final_norm(x)
 
     def loss(self, input_ids: mx.array, target_ids: mx.array) -> mx.array:
@@ -573,21 +578,48 @@ def keep_float_array(name: str, arr: mx.array, passthrough_orig_dtypes: dict[str
 
 
 def quantize_float_array(arr: mx.array) -> tuple[np.ndarray, np.ndarray]:
+    """Standard INT8 per-row quantization. Used for attention and non-MLP weights."""
     f32 = _np_float32(arr)
     if f32.ndim == 2:
-        # Matrices get one scale per row, which usually tracks output-channel
-        # ranges much better than a single tensor-wide scale.
         clip_abs = np.quantile(np.abs(f32), INT8_CLIP_Q, axis=1) if f32.size else np.empty((f32.shape[0],), dtype=np.float32)
         clipped = np.clip(f32, -clip_abs[:, None], clip_abs[:, None])
         scale = np.maximum(clip_abs / 127.0, 1.0 / 127.0).astype(np.float32, copy=False)
         q = np.clip(np.round(clipped / scale[:, None]), -127, 127).astype(np.int8, copy=False)
         return np.ascontiguousarray(q), np.ascontiguousarray(scale.astype(INT8_PER_ROW_SCALE_DTYPE, copy=False))
-
-    # Vectors / scalars use a simpler per-tensor scale.
     clip_abs = float(np.quantile(np.abs(f32).reshape(-1), INT8_CLIP_Q)) if f32.size else 0.0
     scale = np.array(clip_abs / 127.0 if clip_abs > 0.0 else 1.0, dtype=np.float32)
     q = np.clip(np.round(np.clip(f32, -clip_abs, clip_abs) / scale), -127, 127).astype(np.int8, copy=False)
     return np.ascontiguousarray(q), scale
+
+
+INT4_GROUP_SIZE = int(os.environ.get("INT4_GROUP_SIZE", 32))
+INT4_CLIP_RANGE = 7  # ±7 = 16 possible values = 4 bits of information
+
+
+def quantize_int4_per_group(arr: mx.array) -> tuple[np.ndarray, np.ndarray, tuple]:
+    """
+    INT4 per-group-of-32 quantization for MLP weights.
+    Each group of INT4_GROUP_SIZE weights within a row gets its own scale.
+    Stored as int8 (only values -8..7 used); zstd compresses away the wasted range.
+    Returns: q [out, n_groups, group_size], scale [out, n_groups], orig_shape
+    """
+    f32 = _np_float32(arr)
+    orig_shape = f32.shape
+    if f32.ndim == 2:
+        out_f, in_f = f32.shape
+        gs = INT4_GROUP_SIZE
+        pad = (gs - in_f % gs) % gs
+        if pad > 0:
+            f32 = np.pad(f32, ((0, 0), (0, pad)))
+        n_groups = f32.shape[1] // gs
+        grouped = f32.reshape(out_f, n_groups, gs)           # [out, n_groups, gs]
+        group_max = np.abs(grouped).max(axis=2)              # [out, n_groups]
+        scale = np.maximum(group_max / INT4_CLIP_RANGE, 1e-12).astype(np.float16)
+        q = np.clip(np.round(grouped / scale[:, :, None]), -(INT4_CLIP_RANGE + 1), INT4_CLIP_RANGE).astype(np.int8)
+        return np.ascontiguousarray(q), np.ascontiguousarray(scale), orig_shape
+    # Fallback for non-2D: standard INT8
+    q, s = quantize_float_array(arr)
+    return q[:, None, :] if q.ndim == 2 else q[None, None, :], s[:, None] if s.ndim == 1 else s[None, None], orig_shape
 
 
 def quantize_state_dict_int8(flat_state: dict[str, mx.array]) -> tuple[dict[str, object], dict[str, int]]:
@@ -620,15 +652,20 @@ def quantize_state_dict_int8(flat_state: dict[str, mx.array]) -> tuple[dict[str,
             continue
 
         stats["num_float_tensors"] += 1
-        q, s = quantize_float_array(arr)
-        if s.ndim > 0:
-            qmeta[name] = {"scheme": "per_row", "axis": 0}
+        # MLP 2D weights: INT4 per-group-of-32 (our change vs baseline INT8 per-row)
+        if ".mlp." in name and arr.ndim == 2:
+            q, s, orig_shape = quantize_int4_per_group(arr)
+            qmeta[name] = {"scheme": "int4_group", "group_size": INT4_GROUP_SIZE, "orig_shape": list(orig_shape)}
+        else:
+            q, s = quantize_float_array(arr)
+            if s.ndim > 0:
+                qmeta[name] = {"scheme": "per_row", "axis": 0}
         quantized[name] = q
         scales[name] = s
         dtypes[name] = str(arr.dtype).split(".")[-1]
         stats["int8_payload_bytes"] += int(q.nbytes + s.nbytes)
     obj: dict[str, object] = {
-        "__quant_format__": "int8_clean_per_row_v1",
+        "__quant_format__": "int4group_int8_mixed_v1",
         "quantized": quantized,
         "scales": scales,
         "dtypes": dtypes,
@@ -649,8 +686,15 @@ def dequantize_state_dict_int8(quant_obj: dict[str, object]) -> dict[str, mx.arr
         q_np = np.asarray(q, dtype=np.int8)
         dtype_name = quant_obj["dtypes"][name]
         scale = np.asarray(quant_obj["scales"][name], dtype=np.float32)
-        if qmeta.get(name, {}).get("scheme") == "per_row" or scale.ndim > 0:
-            # Broadcast the saved row scale back across trailing dimensions.
+        meta = qmeta.get(name, {})
+        if meta.get("scheme") == "int4_group":
+            # q: [out, n_groups, group_size], scale: [out, n_groups]
+            orig_shape = meta["orig_shape"]
+            dequantized = q_np.astype(np.float32) * scale[:, :, None]  # [out, n_groups, gs]
+            out_f = orig_shape[0]
+            in_f = orig_shape[1] if len(orig_shape) == 2 else dequantized.shape[1] * dequantized.shape[2]
+            out_arr = dequantized.reshape(out_f, -1)[:, :in_f].reshape(orig_shape)
+        elif meta.get("scheme") == "per_row" or scale.ndim > 0:
             out_arr = q_np.astype(np.float32) * scale.reshape((q_np.shape[0],) + (1,) * (q_np.ndim - 1))
         else:
             out_arr = q_np.astype(np.float32) * float(scale)
