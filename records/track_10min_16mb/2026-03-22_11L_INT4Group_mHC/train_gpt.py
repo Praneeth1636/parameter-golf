@@ -37,11 +37,14 @@ from torch import Tensor, nn
 from torch.nn.parallel import DistributedDataParallel as DDP
 
 # TPU support via PyTorch/XLA (falls back to CUDA if not installed)
-try:
-    import torch_xla.core.xla_model as xm
-    _USE_TPU = True
-except ImportError:
-    _USE_TPU = False
+# Set DISABLE_TPU=1 to force CUDA even if torch_xla is installed
+_USE_TPU = False
+if not bool(int(os.environ.get("DISABLE_TPU", "0"))):
+    try:
+        import torch_xla.core.xla_model as xm
+        _USE_TPU = True
+    except (ImportError, Exception):
+        _USE_TPU = False
 
 def _sync(device: "torch.device") -> None:
     """Synchronize device: mark_step on TPU, synchronize on CUDA."""
