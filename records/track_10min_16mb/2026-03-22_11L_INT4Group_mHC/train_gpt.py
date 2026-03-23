@@ -985,11 +985,18 @@ def main() -> None:
             dist.barrier()
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
-        from torch.backends.cuda import enable_cudnn_sdp, enable_flash_sdp, enable_math_sdp, enable_mem_efficient_sdp
-        enable_cudnn_sdp(False)
-        enable_flash_sdp(True)
-        enable_mem_efficient_sdp(False)
-        enable_math_sdp(False)
+        # Enable flash attention on H100/A100; fall back to math on older GPUs (T4 etc)
+        try:
+            from torch.backends.cuda import enable_cudnn_sdp, enable_flash_sdp, enable_math_sdp, enable_mem_efficient_sdp
+            cap = torch.cuda.get_device_capability(device)
+            if cap[0] >= 8:  # Ampere+ supports flash attention
+                enable_cudnn_sdp(False)
+                enable_flash_sdp(True)
+                enable_mem_efficient_sdp(False)
+                enable_math_sdp(False)
+            # else: leave defaults (PyTorch picks best available backend)
+        except Exception:
+            pass
     master_process = rank == 0
 
     logfile = None
