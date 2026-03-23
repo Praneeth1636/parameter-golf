@@ -1027,7 +1027,8 @@ def main() -> None:
         if isinstance(module, CastedLinear):
             module.float()
     restore_low_dim_params_to_fp32(base_model)
-    compiled_model = torch.compile(base_model, dynamic=False)
+    _use_compile = not bool(int(os.environ.get("DISABLE_COMPILE", "0")))
+    compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True) if _use_compile else base_model
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
 
     block_named_params = list(base_model.blocks.named_parameters())
