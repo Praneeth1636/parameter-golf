@@ -953,7 +953,8 @@ def main() -> None:
 
     code = Path(__file__).read_text(encoding="utf-8")
     args = Hyperparameters()
-    if not _USE_TPU:
+    _use_compile = not bool(int(os.environ.get("DISABLE_COMPILE", "0")))
+    if not _USE_TPU and _use_compile:
         zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5)
 
     distributed = "RANK" in os.environ and "WORLD_SIZE" in os.environ
